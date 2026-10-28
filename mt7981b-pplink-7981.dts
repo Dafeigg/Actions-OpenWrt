@@ -3,24 +3,29 @@
  * PPLINK 7981
  * MT7981B + 128MiB SPI-NAND (NMBM) + MT7531 + 256MiB DDR3
  *
- * 硬件事实来源：原厂固件提取的 DTB（bly.mtd5-ubi.bin 内的 FIT）
+ * 硬件事实来源：原厂固件提取的 DTB
  *   - NAND 分区: BL2 / u-boot-env / Factory / FIP / ubi / user
- *   - NAND 由 NMBM 管理（原厂用 generic,nmbm + forced-create，参数为驱动默认值，
- *     这里保持默认，不写 bmt-* 覆盖，否则会 "NMBM configuration mismatch"）
- *   - MT7531: MDIO addr 31, reset = GPIO39, 端口 0-4 = lan1-lan5, 端口6 = CPU
- *   - WAN: gmac1 (gmii) + 外部 PHY addr0 (ethernet-phy-id03a2.9461)
+ *   - NMBM 参数沿用 MTK 驱动默认值（ratio=1, reserved=64），与原厂 generic,nmbm 一致
+ *   - MT7531: MDIO addr 31, reset = GPIO39 高有效, port0-4 = lan1-lan5, port6 = CPU
+ *   - WAN: gmac1 (gmii) + 内置 GbE PHY（mt7981.dtsi 的 int_gbe_phy, addr 0）
  *   - 按键: reset = GPIO1, wps = GPIO0（低有效）
  *   - 机顶盒供电: 12V = GPIO3 输出高, 5V = GPIO4 输出高
  *   - 面板 LED: GPIO12 低有效（拉低点亮）
+ *
+ * 重要：mdio_bus / int_gbe_phy / phy_calibration / eth / pio / spi0 / ubi 等
+ * label 已在 mt7981.dtsi 中定义，本文件只能用 &label 引用扩展，绝不能重复定义，
+ * 否则 dtc 报 duplicate_label FATAL，DTB 编不出来（曾导致 Makefile:1933 .modules Error 2）。
  *
  * UBI 布局：kernel(vol0) + rootfs(vol1) + rootfs_data(vol2)，与 MTK SDK 原厂一致，
  * 因此用 KERNEL_IN_UBI + sysupgrade-tar 配方，root 挂 /dev/ubiblock0_1。
  */
 
 /dts-v1/;
+
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 #include "mt7981.dtsi"
 
@@ -40,7 +45,7 @@
 		/*
 		 * 原厂 U-Boot 的 env 分区是空的（用编译进的默认环境），
 		 * 且默认环境里没有 bootargs，所以这里的 cmdline 会真正生效。
-		 * 原厂内核的 root= 是编进内核的，我们换成 OpenWrt 内核后必须自己给。
+		 * 原厂内核的 root= 是编进内核的，换成 OpenWrt 内核后必须自己给。
 		 */
 		bootargs = "console=ttyS0,115200n1 loglevel=7 earlycon=uart8250,mmio32,0x11002000 ubi.mtd=ubi ubi.block=0,rootfs root=/dev/ubiblock0_1 rootfstype=squashfs rootwait";
 		stdout-path = "serial0:115200n8";
@@ -100,69 +105,61 @@
 		compatible = "mediatek,eth-mac";
 		reg = <1>;
 		phy-mode = "gmii";
-		phy-handle = <&phy0>;
+		/* mt7981.dtsi 已定义内置 GbE PHY（addr 0），这里直接引用 */
+		phy-handle = <&int_gbe_phy>;
 		nvmem-cells = <&macaddr_factory_2a>;
 		nvmem-cell-names = "mac-address";
 	};
+};
 
-	mdio_bus: mdio-bus {
+/* mdio_bus 与 int_gbe_phy 已在 dtsi 内定义，这里只追加 switch */
+&mdio_bus {
+	switch: switch@1f {
+		compatible = "mediatek,mt7531";
+		reg = <31>;
+		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&switch {
+	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		phy0: ethernet-phy@0 {
-			compatible = "ethernet-phy-id03a2.9461";
+		port@0 {
 			reg = <0>;
-			phy-mode = "gmii";
-			nvmem-cells = <&phy_calibration>;
-			nvmem-cell-names = "phy-cal-data";
+			label = "lan1";
 		};
 
-		switch: switch@1f {
-			compatible = "mediatek,mt7531";
-			reg = <31>;
-			reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+		port@1 {
+			reg = <1>;
+			label = "lan2";
+		};
 
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
+		port@2 {
+			reg = <2>;
+			label = "lan3";
+		};
 
-				port@0 {
-					reg = <0>;
-					label = "lan1";
-				};
+		port@3 {
+			reg = <3>;
+			label = "lan4";
+		};
 
-				port@1 {
-					reg = <1>;
-					label = "lan2";
-				};
+		port@4 {
+			reg = <4>;
+			label = "lan5";
+		};
 
-				port@2 {
-					reg = <2>;
-					label = "lan3";
-				};
+		port@6 {
+			reg = <6>;
+			ethernet = <&gmac0>;
+			phy-mode = "2500base-x";
 
-				port@3 {
-					reg = <3>;
-					label = "lan4";
-				};
-
-				port@4 {
-					reg = <4>;
-					label = "lan5";
-				};
-
-				port@6 {
-					reg = <6>;
-					label = "cpu";
-					ethernet = <&gmac0>;
-					phy-mode = "2500base-x";
-
-					fixed-link {
-						speed = <2500>;
-						full-duplex;
-						pause;
-					};
-				};
+			fixed-link {
+				speed = <2500>;
+				full-duplex;
+				pause;
 			};
 		};
 	};
@@ -186,6 +183,7 @@
 		line-name = "stb-5v-en";
 	};
 
+	/* dtsi 未提供，NMBM 需要正确上拉，与官方 nmbm 变体写法一致 */
 	spi0_flash_pins: spi0-flash-pins {
 		mux {
 			function = "spi";
@@ -213,13 +211,26 @@
 
 	spi_nand: spi_nand@0 {
 		compatible = "spi-nand";
+		#address-cells = <1>;
+		#size-cells = <1>;
 		reg = <0>;
+
 		spi-max-frequency = <52000000>;
 		spi-tx-bus-width = <4>;
 		spi-rx-bus-width = <4>;
 
-		/* 与原厂一致：NMBM + 驱动默认 BMT 参数 */
+		/* NMBM：参数取 MTK 驱动默认值，与原厂 generic,nmbm 无参配置等价 */
 		mediatek,nmbm;
+		mediatek,bmt-max-ratio = <1>;
+		mediatek,bmt-max-reserved-blocks = <64>;
+
+		/* NMBM 需要 SPI NAND 校准（读 ID 页），官方 nmbm 变体标配 */
+		spi-cal-enable;
+		spi-cal-mode = "read-data";
+		spi-cal-datalen = <7>;
+		spi-cal-data = /bits/ 8 <0x53 0x50 0x49 0x4e 0x41 0x4e 0x44>;
+		spi-cal-addrlen = <5>;
+		spi-cal-addr = /bits/ 32 <0x0 0x0 0x0 0x0 0x0>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -237,6 +248,10 @@
 				reg = <0x100000 0x80000>;
 			};
 
+			/*
+			 * 只提取 MAC，不要在此定义 phy_calibration
+			 * （该 label 已由 mt7981.dtsi 在 efuse@8dc 定义）
+			 */
 			factory: partition@180000 {
 				label = "Factory";
 				reg = <0x180000 0x200000>;
@@ -254,10 +269,6 @@
 					macaddr_factory_2a: macaddr@2a {
 						reg = <0x2a 0x6>;
 					};
-
-					phy_calibration: calibration@1000 {
-						reg = <0x1000 0x400>;
-					};
 				};
 			};
 
@@ -267,6 +278,7 @@
 				read-only;
 			};
 
+			/* 不写 volumes 子节点：由 sysupgrade-tar 建 kernel/rootfs 双卷 */
 			ubi: partition@580000 {
 				label = "ubi";
 				reg = <0x580000 0x4000000>;
@@ -291,5 +303,6 @@
 
 &wifi {
 	status = "okay";
+
 	mediatek,mtd-eeprom = <&factory 0x0>;
 };
