@@ -47,6 +47,7 @@ jobs:
           install -Dm755 99-pplink-network \
             openwrt/target/linux/mediatek/filogic/base-files/etc/uci-defaults/99-pplink-network
           echo "--- 注入结果 ---"
+          ls -l openwrt/target/linux/mediatek/dts/mt7981b-pplink-7981.dts
           tail -n 22 openwrt/target/linux/mediatek/image/filogic.mk
 
       - name: 更新 feeds
@@ -67,7 +68,31 @@ jobs:
       - name: 编译
         run: |
           cd openwrt
-          make -j"$(nproc)" V=s 2>&1 | tee build.log | tail -n 120
+          if make -j"$(nproc)" V=s > build.log 2>&1; then
+            echo "=== 编译成功 ==="
+            tail -n 40 build.log
+          else
+            echo "::error::编译失败，关键错误如下"
+            echo ""
+            echo "----- 错误行（Error / error: / *** / duplicate label）-----"
+            grep -nE "(\*\*\*|error:|Error [0-9]|undefined reference|Duplicate label|ERROR \(|No rule to make|fatal error)" build.log | head -n 250 || true
+            echo ""
+            echo "----- 设备树相关 -----"
+            grep -nE "(\.dts|\.dtb|dtc|dt-bindings)" build.log | tail -n 60 || true
+            echo ""
+            echo "----- 最后 100 行 -----"
+            tail -n 100 build.log
+            exit 1
+          fi
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: openwrt/build.log
+          retention-days: 5
+          if-no-files-found: ignore
 
       - name: 收集产物
         run: |
