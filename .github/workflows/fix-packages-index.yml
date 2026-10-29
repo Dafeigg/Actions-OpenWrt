@@ -1,0 +1,40 @@
+name: fix-packages-index
+
+# 一次性任务：给 ipk-repo 分支的 packages 源补上 Packages / Packages.gz / Packages.sig
+# 索引与签名取自 ipk-repo-v7（同一次 V7 构建产出，包内容与 V5 完全一致，ABI 2d37ac69）
+# kmods 源保持 ipk-repo 里 V5 私钥签名的那份，不动
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-packages-index.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 搬运 packages 索引与签名
+        run: |
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 -b ipk-repo "$URL" main
+          git clone --depth 1 -b ipk-repo-v7 "$URL" v7
+          ls -l v7/packages/Packages v7/packages/Packages.gz v7/packages/Packages.sig
+          cp v7/packages/Packages     main/packages/Packages
+          cp v7/packages/Packages.gz  main/packages/Packages.gz
+          cp v7/packages/Packages.sig main/packages/Packages.sig
+          cd main
+          git add -A packages
+          git -c user.name="repo-bot" -c user.email="bot@local" commit -m "packages: 补 Packages 索引与签名（V7 构建产物，ABI 2d37ac69）"
+          git push "$URL" HEAD:refs/heads/ipk-repo
+          echo "pushed"
+
+      - name: 校验
+        run: |
+          B=https://raw.githubusercontent.com/${{ github.repository }}/ipk-repo
+          for f in kmods/Packages.sig kmods/Packages packages/Packages packages/Packages.gz packages/Packages.sig; do
+            echo "$f -> $(curl -s -o /dev/null -w '%{http_code} %{size_download}' $B/$f)"
+          done
