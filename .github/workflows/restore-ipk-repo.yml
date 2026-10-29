@@ -1,0 +1,43 @@
+name: restore-ipk-repo
+
+# 一次性任务：把 ipk-repo 分支还原成 ipk-repo-archive（V5 时代、V5 密钥签名）的内容
+# 推送前先把当前（V7 签名）的 ipk-repo 备份到 ipk-repo-v7，执行完可删除本文件
+
+on:
+  push:
+    paths:
+      - '.github/workflows/restore-ipk-repo.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 备份当前 ipk-repo 到 ipk-repo-v7
+        run: |
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 -b ipk-repo "$URL" cur
+          cd cur
+          git push -f "$URL" HEAD:refs/heads/ipk-repo-v7
+          echo "backup ipk-repo -> ipk-repo-v7 ok: $(git rev-parse --short HEAD)"
+
+      - name: 用 ipk-repo-archive 覆盖 ipk-repo
+        run: |
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 -b ipk-repo-archive "$URL" arch
+          cd arch
+          echo "archive commit: $(git rev-parse --short HEAD)"
+          git push -f "$URL" HEAD:refs/heads/ipk-repo
+          echo "restore ok"
+
+      - name: 校验还原结果
+        run: |
+          B=https://raw.githubusercontent.com/${{ github.repository }}/ipk-repo
+          echo "kmods/Packages.sig  -> $(curl -s -o /dev/null -w '%{http_code}' $B/kmods/Packages.sig)"
+          echo "kmods/Packages      -> $(curl -s -o /dev/null -w '%{http_code}' $B/kmods/Packages)"
+          echo "packages/Packages   -> $(curl -s -o /dev/null -w '%{http_code}' $B/packages/Packages)"
+          echo "packages/Packages.sig -> $(curl -s -o /dev/null -w '%{http_code}' $B/packages/Packages.sig)"
+          echo "kmods ipk count: $(curl -s https://api.github.com/repos/${{ github.repository }}/git/trees/ipk-repo?recursive=1 | grep -c '"path": "kmods/.*\.ipk"')"
