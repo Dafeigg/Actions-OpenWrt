@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * PPLINK 7981
+ * MT7981B + 128MiB SPI-NAND (NMBM) + MT7531 + 256MiB DDR3
+ *
+ * V6 差异：仅 ubi 分区由 0x4000000 扩到 0x7280000，其余节点与 V1~V5 逐字节一致。
+ *
+ * 硬件事实来源：原厂固件提取的 DTB
+ *   - NAND 分区: BL2 / u-boot-env / Factory / FIP / ubi（V6 起 ubi 扩到 114.5MiB）
+ *   - NMBM 参数沿用 MTK 驱动默认值（ratio=1, reserved=64），与原厂 generic,nmbm 一致
+ *   - MT7531: MDIO addr 31, reset = GPIO39 高有效, port0-4 = lan1-lan5, port6 = CPU
+ *   - WAN: gmac1 (gmii) + 内置 GbE PHY（mt7981.dtsi 的 int_gbe_phy, addr 0）
+ *   - 按键: reset = GPIO1, wps = GPIO0（低有效）
+ *   - 机顶盒供电: 12V = GPIO3 输出高, 5V = GPIO4 输出高
+ *   - 面板 LED: GPIO12 低有效（拉低点亮）
+ *
+ * 重要：mdio_bus / int_gbe_phy / phy_calibration / eth / pio / spi0 / ubi 等
+ * label 已在 mt7981.dtsi 中定义，本文件只能用 &label 引用扩展，绝不能重复定义，
+ * 否则 dtc 报 duplicate_label FATAL，DTB 编不出来（曾导致 Makefile:1933 .modules Error 2）。
+ *
+ * UBI 布局：kernel(vol0) + rootfs(vol1) + rootfs_data(vol2)，与 MTK SDK 原厂一致，
+ * 因此用 KERNEL_IN_UBI + sysupgrade-tar 配方，root 挂 /dev/ubiblock0_1。
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+#include "mt7981.dtsi"
+
+/ {
+	model = "PPLINK 7981";
+	compatible = "pplink,7981", "mediatek,mt7981";
+
+	aliases {
+		serial0 = &uart0;
+		led-boot = &led_status;
+		led-failsafe = &led_status;
+		led-running = &led_status;
+		led-upgrade = &led_status;
+	};
+
+	chosen {
+		/*
+		 * 原厂 U-Boot 的 env 分区是空的（用编译进的默认环境），
+		 * 且默认环境里没有 bootargs，所以这里的 cmdline 会真正生效。
+		 * 原厂内核的 root= 是编进内核的，换成 OpenWrt 内核后必须自己给。
+		 */
+		bootargs = "console=ttyS0,115200n1 loglevel=7 earlycon=uart8250,mmio32,0x11002000 ubi.mtd=ubi ubi.block=0,rootfs root=/dev/ubiblock0_1 rootfstype=squashfs rootwait";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x10000000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		key-wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&pio 0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	gpio-leds {
+		compatible = "gpio-leds";
+
+		led_status: led-status {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&pio 12 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+	};
+};
+
+&eth {
+	status = "okay";
+
+	gmac0: mac@0 {
+		compatible = "mediatek,eth-mac";
+		reg = <0>;
+		phy-mode = "2500base-x";
+		nvmem-cells = <&macaddr_factory_4>;
+		nvmem-cell-names = "mac-address";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+			pause;
+		};
+	};
+
+	gmac1: mac@1 {
+		compatible = "mediatek,eth-mac";
+		reg = <1>;
+		phy-mode = "gmii";
+		/* mt7981.dtsi 已定义内置 GbE PHY（addr 0），这里直接引用 */
+		phy-handle = <&int_gbe_phy>;
+		nvmem-cells = <&macaddr_factory_2a>;
+		nvmem-cell-names = "mac-address";
+	};
+};
+
+/* mdio_bus 与 int_gbe_phy 已在 dtsi 内定义，这里只追加 switch */
+&mdio_bus {
+	switch: switch@1f {
+		compatible = "mediatek,mt7531";
+		reg = <31>;
+		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&switch {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			label = "lan1";
+		};
+
+		port@1 {
+			reg = <1>;
+			label = "lan2";
+		};
+
+		port@2 {
+			reg = <2>;
+			label = "lan3";
+		};
+
+		port@3 {
+			reg = <3>;
+			label = "lan4";
+		};
+
+		port@4 {
+			reg = <4>;
+			label = "lan5";
+		};
+
+		port@6 {
+			reg = <6>;
+			ethernet = <&gmac0>;
+			phy-mode = "2500base-x";
+
+			fixed-link {
+				speed = <2500>;
+				full-duplex;
+				pause;
+			};
+		};
+	};
+};
+
+&pio {
+	/*
+	 * 机顶盒供电使能，pinctrl 初始化时立刻拉起，不等用户态。
+	 */
+	stb_12v: stb-12v {
+		gpio-hog;
+		gpios = <3 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "stb-12v-en";
+	};
+
+	stb_5v: stb-5v {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "stb-5v-en";
+	};
+
+	/* dtsi 未提供，NMBM 需要正确上拉，与官方 nmbm 变体写法一致 */
+	spi0_flash_pins: spi0-flash-pins {
+		mux {
+			function = "spi";
+			groups = "spi0", "spi0_wp_hold";
+		};
+
+		conf-pu {
+			pins = "SPI0_CS", "SPI0_HOLD", "SPI0_WP";
+			drive-strength = <8>;
+			bias-pull-up = <MTK_PUPD_SET_R1R0_11>;
+		};
+
+		conf-pd {
+			pins = "SPI0_CLK", "SPI0_MOSI", "SPI0_MISO";
+			drive-strength = <8>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_11>;
+		};
+	};
+};
+
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_flash_pins>;
+	status = "okay";
+
+	spi_nand: spi_nand@0 {
+		compatible = "spi-nand";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0>;
+
+		spi-max-frequency = <52000000>;
+		spi-tx-bus-width = <4>;
+		spi-rx-bus-width = <4>;
+
+		/* NMBM：参数取 MTK 驱动默认值，与原厂 generic,nmbm 无参配置等价 */
+		mediatek,nmbm;
+		mediatek,bmt-max-ratio = <1>;
+		mediatek,bmt-max-reserved-blocks = <64>;
+
+		/* NMBM 需要 SPI NAND 校准（读 ID 页），官方 nmbm 变体标配 */
+		spi-cal-enable;
+		spi-cal-mode = "read-data";
+		spi-cal-datalen = <7>;
+		spi-cal-data = /bits/ 8 <0x53 0x50 0x49 0x4e 0x41 0x4e 0x44>;
+		spi-cal-addrlen = <5>;
+		spi-cal-addr = /bits/ 32 <0x0 0x0 0x0 0x0 0x0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "BL2";
+				reg = <0x0 0x100000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "u-boot-env";
+				reg = <0x100000 0x80000>;
+			};
+
+			/*
+			 * 只提取 MAC，不要在此定义 phy_calibration
+			 * （该 label 已由 mt7981.dtsi 在 efuse@8dc 定义）
+			 */
+			factory: partition@180000 {
+				label = "Factory";
+				reg = <0x180000 0x200000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_factory_4: macaddr@4 {
+						reg = <0x4 0x6>;
+					};
+
+					macaddr_factory_2a: macaddr@2a {
+						reg = <0x2a 0x6>;
+					};
+				};
+			};
+
+			partition@380000 {
+				label = "FIP";
+				reg = <0x380000 0x200000>;
+				read-only;
+			};
+
+			/*
+			 * V6 大分区：ubi 由 64MiB 扩到 114.5MiB
+			 *   0x580000 ~ 0x7800000，正好顶到 NMBM 管理区边界
+			 *  （NMBM: 128KiB x 960 块 = 120MiB 数据区，block 960 起是 BMT/签名）
+			 * 0x4600000 之后那 58MiB 在整片 dump 里逐块扫过，全是 0xFF，从未写过数据，
+			 * 所以不需要动 BL2/FIP/Factory，也不必缩任何现有分区。
+			 * 原 "user" 分区（0x4580000, 512KiB，实测全 FF 空分区）已被本次扩容覆盖，删除。
+			 */
+			ubi: partition@580000 {
+				label = "ubi";
+				reg = <0x580000 0x7280000>;
+				compatible = "linux,ubi";
+			};
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&watchdog {
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+
+	mediatek,mtd-eeprom = <&factory 0x0>;
+};
