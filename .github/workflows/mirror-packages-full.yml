@@ -1,0 +1,43 @@
+name: mirror-packages-full
+
+# 一次性任务：把 packages/ 补成和 kmods/ 一样的完整源
+# 原因：packages 源只有 V5 私钥签名的索引可用，索引里列的是 kmods 那 1087 个包，
+#       对应的 .ipk 必须也在 packages/ 目录下，否则客户端装 kmod 时可能拿到 packages 源的文件名 → 404
+# git 按内容去重，所以复制这些 ipk 不会让仓库变大
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mirror-packages-full.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 复制 kmods 的 ipk 到 packages
+        run: |
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 -b ipk-repo "$URL" r
+          cd r
+          echo "before: kmods=$(ls kmods/*.ipk | wc -l) packages=$(ls packages/*.ipk | wc -l)"
+          cp -n kmods/*.ipk packages/ 2>/dev/null || true
+          echo "after : kmods=$(ls kmods/*.ipk | wc -l) packages=$(ls packages/*.ipk | wc -l)"
+          git add -A packages
+          git -c user.name="repo-bot" -c user.email="bot@local" commit -m "packages: 补齐索引里列出的 ipk，保证任一源都能装 [skip ci]" || echo "nothing to commit"
+          git push "$URL" HEAD:refs/heads/ipk-repo
+          echo pushed
+
+      - name: 校验
+        run: |
+          B=https://raw.githubusercontent.com/${{ github.repository }}/ipk-repo
+          echo "Packages     $(curl -s -o /dev/null -w '%{http_code}' $B/packages/Packages)"
+          echo "Packages.sig $(curl -s -o /dev/null -w '%{http_code}' $B/packages/Packages.sig)"
+          echo "kmods/Packages.sig 与 packages/Packages.sig 是否同一个签名："
+          echo "$(curl -s $B/kmods/Packages.sig | sha1sum | cut -c1-16) / $(curl -s $B/packages/Packages.sig | sha1sum | cut -c1-16)"
+          first=$(curl -s $B/packages/Packages | grep -m1 '^Filename:' | awk '{print $2}')
+          echo "索引里第一个 Filename=$first"
+          echo "对应文件 -> $(curl -s -o /dev/null -w '%{http_code}' $B/packages/$first)"
