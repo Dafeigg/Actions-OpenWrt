@@ -1,0 +1,491 @@
+name: Build PPLINK7981 V7 BigOverlay AllKmods
+
+# V7 = V6 大分区 + 全量 kmod 软件源（面向批量出货，杜绝"装不上包"的售后）
+# 与 V6 的差别：
+#   1. 重新打开 CONFIG_ALL_KMODS=y —— V6 关掉它导致内核导出符号集变化，
+#      ABI 从 2d37ac69 变成 0fc837da，旧仓库 1087 个 kmod 全部失配。
+#      V7 开回来，ABI 回到 2d37ac69，kmod 仓库重新覆盖全量（本次目标 >1000 个）
+#   2. 修补 packages 源的签名 —— 上一版 packages/Packages 是手工合并的，没有 Packages.sig，
+#      而固件 opkg.conf 开着 check_signature，每个客户端 opkg update 都会报 wget 8。
+#      本版用编译产出的 usign + key-build 给它补签，客户刷完两个源都能正常更新
+#   3. customfeeds 恢复两条（kmods + packages），开箱即可装包
+#   4. 推送前把上一版 ipk-repo 自动备份到分支 ipk-repo-archive，
+#      并写清"固件与源必须同批"—— 未重刷的老机器仍可从 archive 分支装包
+# 保留 V6 的部分：
+#   - 注入 mt7981b-pplink-7981-big.dts：ubi 0x4000000(64MiB) → 0x7280000(114.5MiB)，
+#     顶到 NMBM 管理区边界(0x7800000)，删掉 512KiB 的空 "user" 分区（实测全 0xFF）
+
+# 以下 V5 原始说明保留：
+# 与 V4 的四点不同：
+#   1. 包集不再由我手写，改为从成熟作者的完整 .config 里提取（包名都经过实际编译验证），
+#      只过滤掉会冲突/会拖垮体积的项，其余全要 → 128MB 闪存不用省
+#   2. dnsmasq 换成 dnsmasq-full（PassWall 的 nftset 分流依赖它，基础版不支持）
+#   3. 编译完把整套 ipk 推到固定分支 ipk-repo，并在固件里预置 customfeeds.conf
+#      → 刷完就有可用软件源，raw.githubusercontent.com 直连，不需要开 Pages
+#   4. kmod 一律不写进 .config，交给 defconfig 按依赖自动 select，避免镜像被撑爆
+on:
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  IPK_BASE: https://raw.githubusercontent.com/Dafeigg/Actions-OpenWrt/ipk-repo
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -a -f || true
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-setuptools rsync unzip zlib1g-dev file wget curl ccache \
+            libelf-dev ecj fastjar java-propose-classpath time
+          echo "nproc=$(nproc)  mem=$(free -m | awk '/Mem:/{print $2}')MB"
+
+      - name: 克隆源码
+        run: |
+          git clone --depth=1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          cd openwrt && git log -1 --pretty='%h %s'
+
+      - name: 注入设备
+        run: |
+          set -e
+          cp mt7981b-pplink-7981-big.dts openwrt/target/linux/mediatek/dts/mt7981b-pplink-7981.dts
+          cat pplink-device.mk >> openwrt/target/linux/mediatek/image/filogic.mk
+          install -Dm755 99-pplink-network \
+            openwrt/target/linux/mediatek/filogic/base-files/etc/uci-defaults/99-pplink-network
+          echo "--- 注入结果 ---"
+          ls -l openwrt/target/linux/mediatek/dts/mt7981b-pplink-7981.dts
+          tail -n 22 openwrt/target/linux/mediatek/image/filogic.mk
+
+      # 预置自带软件源：刷完固件即可在 LuCI 里搜索安装本机 ABI 匹配的包
+      - name: 预置软件源
+        run: |
+          set -e
+          mkdir -p openwrt/files/etc/opkg
+          # 两个源都放：本版已给 packages/Packages 补签名，不会再出现 wget 8
+          cat > openwrt/files/etc/opkg/customfeeds.conf <<'EOF'
+          src/gz pplink_kmods ${{ env.IPK_BASE }}/kmods
+          src/gz pplink_packages ${{ env.IPK_BASE }}/packages
+          EOF
+          sed -i 's/^[[:space:]]*//' openwrt/files/etc/opkg/customfeeds.conf
+          echo "--- customfeeds.conf ---"
+          cat openwrt/files/etc/opkg/customfeeds.conf
+
+      # 不需要第三方 feed：
+      #   luci-app-passwall 本体 → immortalwrt 的 luci feed
+      #   chinadns-ng / ipt2socks / microsocks / dns2socks / tcping / v2ray-geodata → packages feed
+      # 曾经加过 Openwrt-Passwall 的 feed，与官方同名冲突，feeds install 只装官方那份导致路径不存在
+      - name: 更新 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "--- passwall 是否就位 ---"
+          ls -d package/feeds/luci/luci-app-passwall
+          echo "--- 依赖是否就位 ---"
+          for p in chinadns-ng ipt2socks microsocks dns2socks tcping v2ray-geodata; do
+            ls -d package/feeds/*/$p 2>/dev/null || echo "MISSING $p"
+          done
+
+      - name: 合并高大全包集
+        run: |
+          set -e
+          cd openwrt
+          cp ../pplink.config .config
+
+          # 包集来源：成熟作者实际在跑的完整配置，包名天然都是真实存在的
+          echo "=== 拉取成熟作者的完整配置 ==="
+          BIG=""
+          for u in \
+            "https://raw.githubusercontent.com/lgs2007m/Actions-OpenWrt/main/.config" \
+            "https://raw.githubusercontent.com/P3TERX/Actions-OpenWrt/master/.config" ; do
+            if curl -fsSL --max-time 90 -o /tmp/big.config "$u"; then
+              echo "OK  $u  ($(wc -l < /tmp/big.config) 行)"; BIG=/tmp/big.config; break
+            else
+              echo "跳过 $u"
+            fi
+          done
+
+          if [ -n "$BIG" ]; then
+            RAWS=$(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "$BIG" || true)
+            # 过滤规则：
+            #   kmod-     → 一律不要。写了就会塞进镜像；交给 defconfig 按依赖自动 select
+            #   dnsmasq / firewall / odhcpd / samba4 → 与我们选的 full 版/ksmbd 冲突或重复
+            #   代理重复项 → 已用 PassWall，openclash/homeproxy/ssr-plus 再进来会打架
+            #   私有包     → mtwifi/luci-app-mtk 等只存在于作者自己的源码树，官方源没有
+            #   重型服务   → docker/qbittorrent/adguard 等编译极慢，容易把 355 分钟吃光
+            grep -E '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "$BIG" \
+              | grep -vE '^CONFIG_PACKAGE_kmod-' \
+              | grep -vE '^CONFIG_PACKAGE_(dnsmasq|firewall|odhcpd|samba4-server|luci-app-samba4|luci-app-opkg)=' \
+              | grep -vE '(openclash|homeproxy|ssr-plus|passwall2|mtwifi|luci-app-mtk|pushbot|serverchan|nikki|dockerman|luci-app-docker|qbittorrent|transmission|aria2|adguardhome|smartdns)' \
+              > /tmp/add.list || true
+            ADD=$(wc -l < /tmp/add.list)
+            cat /tmp/add.list >> .config
+            echo "原始包 $RAWS 条 → 过滤后追加 $ADD 条"
+          else
+            echo "::warning::没拉到外部配置，仅使用内置精调清单"
+          fi
+
+          # 下面是必须成立的精调项，放在最后 → 覆盖上面任何同名设置
+          # 不存在的符号会被 defconfig 默默丢掉，不会导致构建失败
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_NaiveProxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Server=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadow_TLS=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_tuic_client=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Simple_Obfs=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geoview=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Plugin=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
+          CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-nft-nat=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-commands=y
+          CONFIG_PACKAGE_luci-app-advanced-reboot=y
+          CONFIG_PACKAGE_luci-app-attendedsysupgrade=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-sqm=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-app-wol=y
+          CONFIG_PACKAGE_luci-app-arpbind=y
+          CONFIG_PACKAGE_luci-app-nlbwmon=y
+          CONFIG_PACKAGE_luci-app-watchcat=y
+          CONFIG_PACKAGE_kmod-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+          CONFIG_PACKAGE_luci-proto-wireguard=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-storage-uas=y
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_kmod-fs-exfat=y
+          CONFIG_PACKAGE_kmod-fs-ntfs3=y
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_luci-app-diskman=y
+          CONFIG_PACKAGE_luci-app-ksmbd=y
+          CONFIG_PACKAGE_ksmbd-server=y
+          CONFIG_PACKAGE_kmod-tcp-bbr=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_wget-ssl=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_tcpdump=y
+          CONFIG_PACKAGE_usbutils=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-sqm-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-wol-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ksmbd-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-nlbwmon-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-arpbind-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-commands-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-watchcat-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-attendedsysupgrade-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
+          # 全量内核模块：批量出货场景下必须提供"任何 kmod 都能装"的源，
+          # 代价是内核阶段多 60~90 分钟、镜像里多一批 .ko
+          CONFIG_ALL_KMODS=y
+          EOF
+          sed -i 's/^[[:space:]]*//' .config
+          make defconfig
+
+          echo "--- 设备符号 ---"
+          grep -E "CONFIG_TARGET_mediatek_filogic_DEVICE_pplink_7981" .config || true
+
+          echo "--- 规模统计 ---"
+          TOTAL=$(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' .config || true)
+          KMODS=$(grep -cE '^CONFIG_PACKAGE_kmod-[A-Za-z0-9_.+-]+=y$' .config || true)
+          echo "选中软件包总数: $TOTAL（其中内核模块 $KMODS）"
+          if [ "$TOTAL" -gt 420 ]; then
+            echo "::warning::包数偏多($TOTAL)，V7 的 ubi 分区 114.5MiB，仍可能超限"
+          fi
+
+          echo "--- 期望的包是否真的选上（缺的列在 UNRESOLVED 里，不中断）---"
+          MISS=""
+          for p in luci-app-passwall kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-inet-diag \
+                   kmod-tun dnsmasq-full xray-core luci-app-ttyd luci-app-sqm luci-app-ddns \
+                   luci-app-upnp luci-app-nlbwmon luci-app-wol luci-app-arpbind luci-app-ksmbd \
+                   luci-app-diskman luci-theme-argon kmod-wireguard luci-proto-wireguard \
+                   kmod-usb-storage-uas kmod-fs-exfat block-mount kmod-tcp-bbr htop nano iperf3 tcpdump; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "  OK   $p"
+            else
+              echo "  MISS $p"; MISS="$MISS $p"
+            fi
+          done
+          echo "UNRESOLVED:$MISS"
+
+          grep -q "CONFIG_TARGET_mediatek_filogic_DEVICE_pplink_7981=y" .config || {
+            echo "::error::设备符号没生成，检查 filogic.mk 注入"; exit 1; }
+          grep -q "CONFIG_PACKAGE_luci-app-passwall=y" .config || {
+            echo "::error::PassWall 没选上，检查 feed 是否装上"; exit 1; }
+          grep -q "CONFIG_PACKAGE_kmod-nft-tproxy=y" .config || {
+            echo "::error::kmod-nft-tproxy 没被 select，PassWall 装了也跑不了"; exit 1; }
+
+      # 单独成步便于定位：卡住时一眼能看出是卡在下载
+      # 绝对不能接 `| tail -n N`，tail 不带 -f 要读到 EOF 才输出，页面会一片空白
+      - name: 预下载源码包
+        run: |
+          cd openwrt
+          make -j1 download 2>&1 | tee download.log | grep --line-buffered -E \
+            "^(Downloading|--|make\[|WARNING:)"
+          echo "=== 下载完成，dl 总大小 ==="
+          du -sh dl || true
+
+      - name: 编译
+        run: |
+          cd openwrt
+          set -o pipefail
+          START=$(date +%s)
+
+          (
+            while true; do
+              sleep 180
+              NOW=$(date +%s)
+              echo "----- [心跳] 已编译 $(( (NOW-START)/60 ))m  内存 $(free -m | awk '/Mem:/{print $3"MB used / "$7"MB avail"}') -----"
+              echo "----- 日志 $(ls -l build.log 2>/dev/null | awk '{print $5" bytes"}') -----"
+              tail -n 6 build.log 2>/dev/null | sed 's/^/    /'
+            done
+          ) &
+          HB=$!
+          trap "kill $HB 2>/dev/null || true" EXIT
+
+          make -j"$(nproc)" V=s 2>&1 | tee build.log | \
+            { grep --line-buffered -E "^(make\[[0-9]+\]: (Entering|Leaving) directory|Packaging|Installing|Configuring|Downloading|ERROR|.*Error [0-9])" || true; }
+          RC=$?
+
+          echo "=== make 退出码: $RC ==="
+          echo "=== 编译耗时: $(( ($(date +%s)-START)/60 )) 分钟 ==="
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::编译失败，关键错误如下"
+            grep -nE "(\*\*\*|error:|Error [0-9]|undefined reference|Duplicate label|ERROR \(|No rule to make|fatal error)" build.log | head -n 250 || true
+            tail -n 120 build.log
+            exit 1
+          fi
+          echo "=== 编译成功 ==="
+          tail -n 30 build.log
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-v7
+          path: |
+            openwrt/build.log
+            openwrt/download.log
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \
+            \( -name "*pplink*" -o -name "*.manifest" -o -name "sha256sums" \) \
+            -exec cp {} out/ \;
+          ls -lh out
+          echo "--- 固件体积 ---"
+          du -h out/*sysupgrade.bin 2>/dev/null || true
+          echo "--- kmod ABI（本版）---"
+          grep -m1 -E "^kernel - " out/*.manifest || true
+          echo "--- 远端现有仓库 ABI（推送后会被本版覆盖）---"
+          curl -fsSL --max-time 90 "${{ env.IPK_BASE }}/kmods/Packages.gz" 2>/dev/null \
+            | gunzip -c 2>/dev/null | grep -m1 -oE "kernel \(= [^)]+\)" || echo "(取不到)"
+          echo "--- 关键包 ---"
+          grep -cE "^kmod-" out/*.manifest || true
+          grep -E "^(luci-app-passwall|xray-core|kmod-nft-tproxy|kmod-nft-socket|kmod-inet-diag|dnsmasq-full|luci-app-ttyd|luci-app-sqm|luci-app-ksmbd|kmod-wireguard) " out/*.manifest || true
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pplink7981-firmware-v7
+          path: out/
+          if-no-files-found: error
+
+      # 把本次编译产出的全部 ipk 整理成标准 opkg 仓库
+      # kmod 的 Depends 写死 kernel (=6.6.159~<hash>-r1)，只有这一批能装进这台机器
+      - name: 打包自建软件源
+        run: |
+          set -e
+          rm -rf ipk-repo
+          mkdir -p ipk-repo/kmods ipk-repo/packages
+
+          # ---- kmods：直接搬编译产物，Packages 与 Packages.sig 都是编译系统生成的 ----
+          cp openwrt/bin/targets/mediatek/filogic/packages/*.ipk ipk-repo/kmods/ 2>/dev/null || true
+          cp openwrt/bin/targets/mediatek/filogic/packages/Packages* ipk-repo/kmods/ 2>/dev/null || true
+
+          # ---- packages：合并各 feed 的用户态包，索引需要自己重建 + 重新签名 ----
+          rm -f /tmp/pkgs.txt
+          for f in base luci packages routing telephony; do
+            if [ -d "openwrt/bin/packages/aarch64_cortex-a53/$f" ]; then
+              cp openwrt/bin/packages/aarch64_cortex-a53/$f/*.ipk ipk-repo/packages/ 2>/dev/null || true
+              cat openwrt/bin/packages/aarch64_cortex-a53/$f/Packages >> /tmp/pkgs.txt 2>/dev/null || true
+            fi
+          done
+          if [ -s /tmp/pkgs.txt ]; then
+            cp /tmp/pkgs.txt ipk-repo/packages/Packages
+          fi
+
+          # ---- 关键：给 packages/Packages 补签名 ----
+          # 固件 /etc/opkg.conf 里 option check_signature 是开的，opkg 对每个源都要拉 Packages.sig。
+          # 编译系统只会给 kmods（target 的 packages 目录）签名，手工合并的 packages 索引没有 sig，
+          # 客户端 opkg update 就会报 "Failed to download .../Packages.sig, wget returned 8"。
+          # 这里用同一次构建里生成的 usign 与密钥签名，与固件内 /etc/opkg/keys/<id> 天然配对。
+          USIGN=openwrt/staging_dir/host/bin/usign
+          KEY=openwrt/key-build
+          if [ -x "$USIGN" ] && [ -f "$KEY" ] && [ -f openwrt/key-build.pub ] \
+             && [ -f ipk-repo/packages/Packages ]; then
+            "$USIGN" -S -m ipk-repo/packages/Packages -s "$KEY"
+            echo "--- packages 签名完成 ---"
+            ls -l ipk-repo/packages/Packages.sig
+            echo "--- 本版构建密钥公钥 id（同时应出现在固件 /etc/opkg/keys/ 下）---"
+            "$USIGN" -F -p openwrt/key-build.pub || true
+            echo "--- 自验 ---"
+            if "$USIGN" -V -m ipk-repo/packages/Packages -p openwrt/key-build.pub; then
+              echo "OK  packages/Packages 验签通过"
+            else
+              echo "::error::packages/Packages 自验失败，客户端会装不上包"
+              exit 1
+            fi
+          else
+            echo "::warning::usign / key-build(.pub) 缺失，packages 源将没有签名（客户端会报 wget 8）"
+            ls -l "$USIGN" "$KEY" openwrt/key-build.pub 2>/dev/null || true
+          fi
+
+          # ---- 压缩索引（签名针对明文 Packages，gz 只是传输用）----
+          cd ipk-repo
+          [ -f kmods/Packages ] && gzip -kf kmods/Packages || true
+          [ -f packages/Packages ] && gzip -kf packages/Packages || true
+
+          echo "=== 仓库规模 ==="
+          du -sh .
+          echo "kmods: $(ls kmods/*.ipk 2>/dev/null | wc -l) ipk    packages: $(ls packages/*.ipk 2>/dev/null | wc -l) ipk"
+          echo "--- 签名文件 ---"
+          ls -l kmods/Packages.sig packages/Packages.sig 2>/dev/null || true
+          echo "--- 关键 kmod 是否在库里 ---"
+          ls kmods/ | grep -E "nft-tproxy|nft-socket|inet-diag|kmod-tun_|wireguard" || true
+
+      - name: 上传 ipk 仓库
+        uses: actions/upload-artifact@v4
+        with:
+          name: pplink7981-ipk-repo-v7
+          path: ipk-repo/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # 推到固定分支：raw.githubusercontent.com/<repo>/ipk-repo/... 可直接当 opkg 源
+      - name: 发布软件源到 ipk-repo 分支
+        run: |
+          set -e
+          N=$(ls ipk-repo/kmods/*.ipk 2>/dev/null | wc -l)
+          if [ "$N" -lt 900 ]; then
+            echo "::warning::本次只有 $N 个 kmod（ALL_KMODS 未生效？），为保护现有仓库跳过推送。"
+            exit 0
+          fi
+
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # 推送前把上一版整仓备份到 ipk-repo-archive 分支。
+          # 原因：每批固件用的是自己那次构建的签名密钥，ABI 也可能变化，
+          # 未刷本版的机器靠这个 archive 分支仍能装包。
+          echo "=== 备份上一版 ipk-repo ==="
+          OLD=$(git ls-remote "$URL" refs/heads/ipk-repo 2>/dev/null | awk '{print $1}' || true)
+          if [ -n "$OLD" ]; then
+            rm -rf /tmp/oldrepo && mkdir -p /tmp/oldrepo && cd /tmp/oldrepo
+            git init -q
+            git remote add origin "$URL"
+            if git fetch -q --depth=1 origin ipk-repo 2>/dev/null; then
+              git push -q -f origin FETCH_HEAD:refs/heads/ipk-repo-archive \
+                && echo "已备份 → 分支 ipk-repo-archive ($OLD)" \
+                || echo "::warning::archive 备份推送失败，旧仓库仍可从历史 $OLD 找回"
+            else
+              echo "::warning::旧分支拉取失败，跳过备份"
+            fi
+            cd "$GITHUB_WORKSPACE"
+          else
+            echo "ipk-repo 分支尚不存在，无需备份"
+          fi
+
+          cd ipk-repo
+          git init -q
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          cat > README.md <<'EOF'
+          # PPLINK7981 专用软件源
+
+          本目录由 Actions 自动生成，与 PPLINK7981 固件同批编译，
+          内核模块的 ABI 与固件完全匹配。
+
+          ## 使用方法
+
+          固件已预置 /etc/opkg/customfeeds.conf，刷完直接可用。
+          手动添加：
+
+              echo "src/gz pplink_kmods ${{ env.IPK_BASE }}/kmods" >> /etc/opkg/customfeeds.conf
+              echo "src/gz pplink_packages ${{ env.IPK_BASE }}/packages" >> /etc/opkg/customfeeds.conf
+              opkg update
+
+          ## 注意
+
+          kmods 目录只对生成它的那一版内核有效（依赖里写死了 kernel ABI 哈希）。
+          本目录每次重新编译固件都会被覆盖，**固件与源必须同批**。
+
+          上一版仓库会自动备份到分支 `ipk-repo-archive`，未刷新固件的机器可改用：
+
+              sed -i 's#/ipk-repo/#/ipk-repo-archive/#g' /etc/opkg/customfeeds.conf
+              opkg update
+
+          ## 国内网络
+
+          raw.githubusercontent.com 偶有不通，可换 jsDelivr 镜像：
+
+              sed -i 's#https://raw.githubusercontent.com/\([^/]*\)/\([^/]*\)/ipk-repo#https://cdn.jsdelivr.net/gh/\1/\2@ipk-repo#g' \
+                /etc/opkg/customfeeds.conf
+              opkg update
+          EOF
+          git add -A
+          git commit -q -m "ipk repo $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:ipk-repo
+          echo "已推送 → ${{ env.IPK_BASE }}"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-v7-${{ github.run_number }}
+          name: PPLINK7981 V7 BigOverlay AllKmods build ${{ github.run_number }}
+          files: out/*
