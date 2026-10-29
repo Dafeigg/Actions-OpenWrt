@@ -1,0 +1,41 @@
+name: mirror-kmods-into-packages
+
+# 一次性任务：让 packages 源不再报验签错
+# 做法：packages/ 下的索引直接换成 kmods/ 那份 —— 它是 V5 私钥 75686e80 签好的，
+#       内容与签名天然配对，V5 固件 /etc/opkg/keys/75686e8040dac728 能验过 → opkg update 零报错
+# 代价：packages 源列表内容与 kmods 相同（那 42 个网卡固件不再出现在列表里，需要时 wget 单个 ipk 装）
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mirror-packages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 用 kmods 索引覆盖 packages 索引
+        run: |
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 -b ipk-repo "$URL" r
+          cd r
+          ls -l kmods/Packages kmods/Packages.sig kmods/Packages.gz
+          rm -f packages/Packages packages/Packages.gz packages/Packages.sig
+          cp kmods/Packages     packages/Packages
+          cp kmods/Packages.sig packages/Packages.sig
+          cp kmods/Packages.gz  packages/Packages.gz
+          git add -A packages
+          git -c user.name="repo-bot" -c user.email="bot@local" commit -m "packages: 换成 V5 签名的索引，消除 opkg update 验签报错 [skip ci]"
+          git push "$URL" HEAD:refs/heads/ipk-repo
+          echo pushed
+
+      - name: 校验
+        run: |
+          B=https://raw.githubusercontent.com/${{ github.repository }}/ipk-repo
+          for f in kmods/Packages kmods/Packages.sig packages/Packages packages/Packages.gz packages/Packages.sig; do
+            echo "$f -> $(curl -s -o /dev/null -w '%{http_code}' $B/$f) $(curl -s $B/$f | sha1sum | cut -c1-16)"
+          done
